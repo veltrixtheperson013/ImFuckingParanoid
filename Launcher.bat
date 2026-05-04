@@ -17,7 +17,7 @@ if errorlevel 1 (
 )
 
 if not exist "%PS_SCRIPT%" (
-    echo ERROR: Could not find privacy-script.ps1
+    echo ERROR: Could not find actualscript.ps1
     echo Expected at:
     echo %PS_SCRIPT%
     echo.
