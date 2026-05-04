@@ -2,7 +2,7 @@
 
 An aggressive Windows telemetry reduction script for users who want tighter control over outbound data and system diagnostics.
 
-**Version:** 0.1 (Initial Beta)
+**Version:** 0.11 (Initial Beta)
 
 ---
 
