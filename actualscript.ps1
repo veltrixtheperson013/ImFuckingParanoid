@@ -24,6 +24,40 @@ function Log-Debug {
     Log $msg "DEBUG" "DarkGray"
 }
 
+function Invoke-WithTimeout {
+    param(
+        [scriptblock]$Script,
+        [object[]]$Arguments = @(),
+        [int]$TimeoutSeconds = 10,
+        [string]$OperationName = "Operation"
+    )
+
+    Log-Debug "Starting timed operation: $OperationName (timeout=${TimeoutSeconds}s)"
+
+    $job = Start-Job -ScriptBlock $Script -ArgumentList $Arguments
+
+    $completed = Wait-Job $job -Timeout $TimeoutSeconds
+
+    if (-not $completed) {
+        Log "Timeout exceeded for: $OperationName. Aborting." "ERROR" "Red"
+        Stop-Job $job -Force | Out-Null
+        Remove-Job $job | Out-Null
+        return $false
+    }
+
+    try {
+        Receive-Job $job -ErrorAction Stop | Out-Null
+        Log-Debug "Completed: $OperationName"
+    } catch {
+        Log "Error in ${OperationName}: $_" "ERROR" "Red"
+        Remove-Job $job | Out-Null
+        return $false
+    }
+
+    Remove-Job $job | Out-Null
+    return $true
+}
+
 function Show-Banner {
     Clear-Host
     Write-Host ""
@@ -59,9 +93,9 @@ function Print-SystemInfo {
         $winType = if ($build -ge 22000) { "Windows 11" } else { "Windows 10" }
 
         Log "OS Type: $winType"
-        Log "Machine Name: $($env:COMPUTERNAME)"
-        Log "User: $($env:USERNAME)"
-        Log "Domain: $($env:USERDOMAIN)"
+        Log "Machine Name: $env:COMPUTERNAME"
+        Log "User: $env:USERNAME"
+        Log "Domain: $env:USERDOMAIN"
         Log "OS: $($os.Caption) ($($os.Version))"
         Log "Build: $build"
         Log "Manufacturer: $($cs.Manufacturer)"
@@ -121,19 +155,37 @@ function Confirm-Action {
 }
 
 function Create-RestorePoint {
+    Write-Host "`nCreate a system restore point before continuing? (Y/N)"
+    $key = [Console]::ReadKey($true)
+
+    if ($key.Key -ne "Y") {
+        Log "User skipped restore point creation" "INFO" "DarkGray"
+        return
+    }
+
     Log "Creating restore point"
+    Write-Host "Creating system rollback checkpoint before modifications" -ForegroundColor DarkGray
 
     try {
         Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
-        Checkpoint-Computer -Description "Pre-PrivacyScript" -RestorePointType "MODIFY_SETTINGS"
-        Log "Restore point success" "INFO" "Green"
+
+        Log-Debug "Invoking Checkpoint-Computer"
+        Checkpoint-Computer -Description "Pre-PrivacyScript" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+
+        Log "Restore point created successfully" "INFO" "Green"
+
     } catch {
-        Log "Restore point failed: $_" "ERROR" "Red"
+        if ($_.Exception.Message -match "1440") {
+            Log "Restore point skipped due to 24h system limit" "INFO" "Yellow"
+        } else {
+            Log "Restore point failed: $_" "ERROR" "Red"
+        }
     }
 }
 
 function Apply-Hosts {
-    Log "Hosts operation start"
+    Log "Apply Hosts" "INFO" "Cyan"
+    Write-Host "Blocking telemetry endpoints using hosts file" -ForegroundColor DarkGray
 
     try {
         Copy-Item "$env:windir\System32\drivers\etc\hosts" $BackupHosts -Force
@@ -147,17 +199,28 @@ function Apply-Hosts {
         "settings-win.data.microsoft.com"
     )
 
+    $hostsPath = "$env:windir\System32\drivers\etc\hosts"
+
     foreach ($d in $domains) {
-        Log-Debug "Domain check: $d"
+        Log-Debug "Processing domain: $d"
 
         try {
-            $hosts = Get-Content "$env:windir\System32\drivers\etc\hosts"
+            $hosts = Get-Content $hostsPath
+
             if ($hosts -match $d) {
                 Log "Exists: $d" "INFO" "Green"
             } else {
-                Add-Content "$env:windir\System32\drivers\etc\hosts" "0.0.0.0`t$d"
-                Log "Added: $d" "INFO" "Green"
+                Add-Content $hostsPath "0.0.0.0`t$d"
+                Log "Added: $d" "INFO" "Yellow"
             }
+
+            $verify = Get-Content $hostsPath | Select-String $d
+            if ($verify) {
+                Log "Verified block: $d" "INFO" "Green"
+            } else {
+                Log "Verification failed: $d" "ERROR" "Red"
+            }
+
         } catch {
             Log "Hosts error ($d): $_" "ERROR" "Red"
         }
@@ -165,23 +228,41 @@ function Apply-Hosts {
 }
 
 function Apply-Services {
+    Log "Apply Services" "INFO" "Cyan"
+    Write-Host "Disabling telemetry services" -ForegroundColor DarkGray
+
     $svcs = @("DiagTrack","dmwappushservice")
 
     foreach ($s in $svcs) {
-        Log-Debug "Service check: $s"
+        Log-Debug "Processing service: $s"
 
         try {
             $svc = Get-Service $s -ErrorAction Stop
-            Log "Before: $s = $($svc.Status)"
+            Log "Before: Status=$($svc.Status) StartType=$($svc.StartType)"
 
-            Stop-Service $s -Force -ErrorAction SilentlyContinue
-            Set-Service $s -StartupType Disabled
+            Log-Debug "Attempting Stop-Service on $s"
+            Stop-Service $s -Force -ErrorAction Stop
 
+            Log-Debug "Setting StartupType Disabled for $s"
+            Set-Service $s -StartupType Disabled -ErrorAction Stop
+
+            Start-Sleep -Milliseconds 500
+
+            Log-Debug "Re-querying service state for $s"
             $svc2 = Get-Service $s
-            $ok = ($svc2.StartType -eq "Disabled")
 
-            if ($ok) { $color = "Green" } else { $color = "Red" }
-            Log "After: $s Disabled=$ok" "INFO" $color
+           $ok = Invoke-WithTimeout `
+    -OperationName "Service:$s" `
+    -Arguments @($s) `
+    -Script {
+        param($name)
+        Stop-Service $name -Force -ErrorAction SilentlyContinue
+        Set-Service $name -StartupType Disabled -ErrorAction Stop
+    }
+
+if (-not $ok) {
+    Log "Service operation failed or timed out: $s" "ERROR" "Red"
+}
 
         } catch {
             Log "Service error ($s): $_" "ERROR" "Red"
@@ -190,75 +271,93 @@ function Apply-Services {
 }
 
 function Apply-Registry {
+    Log "Apply Registry" "INFO" "Cyan"
+    Write-Host "Applying telemetry and advertising policy restrictions" -ForegroundColor DarkGray
+
     $items = @(
         @{P="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection";N="AllowTelemetry";V=0},
         @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo";N="DisabledByGroupPolicy";V=1}
     )
 
     foreach ($i in $items) {
-        Log-Debug "Registry op: $($i.N)"
+        Log-Debug "Processing registry: $($i.N)"
 
-        try {
-            if (-not (Test-Path $i.P)) {
-                New-Item $i.P -Force | Out-Null
+        $ok = Invoke-WithTimeout `
+            -OperationName "Registry:$($i.N)" `
+            -Arguments @($i.P, $i.N, $i.V) `
+            -Script {
+                param($path, $name, $value)
+
+                if (-not (Test-Path $path)) {
+                    New-Item $path -Force | Out-Null
+                }
+
+                Set-ItemProperty -Path $path -Name $name -Value $value -Type DWord -ErrorAction Stop
             }
 
-            $before = (Get-ItemProperty $i.P -Name $i.N -ErrorAction SilentlyContinue).$($i.N)
-            Log "Before: $($i.N)=$before"
-
-            Set-ItemProperty $i.P $i.N $i.V -Type DWord
-
-            $after = (Get-ItemProperty $i.P -Name $i.N).$($i.N)
-            $ok = ($after -eq $i.V)
-
-            if ($ok) { $color = "Green" } else { $color = "Red" }
-            Log "After: $($i.N)=$after OK=$ok" "INFO" $color
-
-        } catch {
-            Log "Registry error ($($i.N)): $_" "ERROR" "Red"
+        if ($ok) {
+            try {
+                $after = (Get-ItemProperty -Path $i.P -Name $i.N -ErrorAction Stop).$($i.N)
+                Log "After: $($i.N)=$after" "INFO" "Green"
+            } catch {
+                Log "Verification failed: $($i.N): $_" "ERROR" "Red"
+            }
+        } else {
+            Log "Failed or timed out: $($i.N)" "ERROR" "Red"
         }
     }
 }
 
 function Apply-Tasks {
+    Log "Apply Tasks" "INFO" "Cyan"
+    Write-Host "Disabling telemetry-related scheduled tasks" -ForegroundColor DarkGray
+
     $tasks = @(
         @{Path="\Microsoft\Windows\Application Experience\";Name="Microsoft Compatibility Appraiser"}
     )
 
     foreach ($t in $tasks) {
-        Log-Debug "Task check: $($t.Name)"
+        Log-Debug "Processing task: $($t.Name)"
 
-        try {
-            Disable-ScheduledTask -TaskName $t.Name -TaskPath $t.Path
+        $ok = Invoke-WithTimeout `
+            -OperationName "Task:$($t.Name)" `
+            -Arguments @($t.Name, $t.Path) `
+            -Script {
+                param($name, $path)
 
-            $task2 = Get-ScheduledTask -TaskName $t.Name -TaskPath $t.Path
-            $ok = ($task2.State -ne "Ready")
+                Disable-ScheduledTask -TaskName $name -TaskPath $path -ErrorAction Stop | Out-Null
+            }
 
-            if ($ok) { $color = "Green" } else { $color = "Red" }
-            Log "Task Disabled=$ok ($($t.Name))" "INFO" $color
-
-        } catch {
-            Log "Task error ($($t.Name)): $_" "ERROR" "Red"
+        if ($ok) {
+            Log "Task disable issued: $($t.Name)" "INFO" "Green"
+        } else {
+            Log "Task operation failed or timed out: $($t.Name)" "ERROR" "Red"
         }
     }
 }
 
 function Apply-Firewall {
+    Log "Apply Firewall" "INFO" "Cyan"
+    Write-Host "Blocking outbound telemetry IPs" -ForegroundColor DarkGray
+
     $ips = @("134.170.30.202")
 
     foreach ($ip in $ips) {
-        Log-Debug "Firewall check: $ip"
+        Log-Debug "Processing firewall IP: $ip"
 
         try {
             $name = "$FirewallTag-$ip"
-            $exists = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
 
-            if ($exists) {
-                Log "Exists: $name" "INFO" "Green"
-            } else {
+            if (-not (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) {
                 New-NetFirewallRule -DisplayName $name -Direction Outbound -Action Block -RemoteAddress $ip | Out-Null
-                Log "Created: $name" "INFO" "Green"
+                Log "Rule created: $name"
             }
+
+            $verify = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
+            $ok = ($verify -ne $null)
+
+            if ($ok) { $color = "Green" } else { $color = "Red" }
+            Log "Verification: RuleExists=$ok" "INFO" $color
 
         } catch {
             Log "FW error $($ip): $_" "ERROR" "Red"
@@ -290,4 +389,43 @@ switch ($choice) {
 }
 
 Log "Done. Reboot recommended."
+
+Write-Host "`nRestart your PC now? (Y/N)"
+$key = [Console]::ReadKey($true)
+
+if ($key.Key -eq "Y") {
+    Log "User opted to restart system" "INFO" "Yellow"
+
+    $maxAttempts = 3
+    $attempt = 1
+    $success = $false
+
+    while ($attempt -le $maxAttempts -and -not $success) {
+        Log-Debug "Restart attempt $attempt of $maxAttempts"
+
+        try {
+            Log "Issuing Restart-Computer -Force" "INFO" "Cyan"
+            Restart-Computer -Force -ErrorAction Stop
+
+            # If execution reaches here, command was accepted by PowerShell
+            $success = $true
+            Log "Restart command issued successfully" "INFO" "Green"
+        } catch {
+            Log "Restart attempt $attempt failed: $_" "ERROR" "Red"
+        }
+
+        if (-not $success) {
+            Start-Sleep -Seconds 2
+            $attempt++
+        }
+    }
+
+    if (-not $success) {
+        Log "All restart attempts failed after $maxAttempts tries" "ERROR" "Red"
+    }
+
+} else {
+    Log "User declined restart. Exiting." "INFO" "DarkGray"
+    exit
+}
 Pause
