@@ -2,7 +2,7 @@
 
 An aggressive Windows telemetry reduction script for users who want tighter control over outbound data and system diagnostics.
 
-**Version:** 0.12
+**Version:** 1.0.0
 
 ---
 
@@ -36,8 +36,12 @@ The script can apply the following categories of changes:
 - Creates outbound block rules for known telemetry IPs
 
 ### Menu System
-- Interactive arrow-key menu to selectively apply changes
-- Supports partial application instead of all-or-nothing
+- Interactive arrow-key menu with richer console output
+- `Express Settings` preset for a recommended baseline
+- `Custom` mode for category-by-category selection
+- Automatically scans selected tweaks before applying them
+- Cancels the run if the selected tweaks are already applied
+- Prompts before continuing when only some tweaks still need work
 
 ---
 
@@ -88,7 +92,38 @@ You are responsible for any changes made to your system.
 ## Usage
 
 1. Run Launcher.bat (it's that simple)
-2. Select what you want disabled
-3. Enter
+2. Choose `Express Settings` for the recommended baseline or `Custom` to pick categories yourself
+3. Review the scan result
+4. If tweaks are already applied, the script exits without changing anything
+5. If some tweaks are still pending, confirm to continue
+
+## Build A Setup EXE
+
+This repo now includes an Inno Setup installer script:
+
+- `installer.iss` builds a Windows installer
+- `BuildInstaller.bat` compiles it if Inno Setup 6 is installed
+
+Steps:
+
+1. Install Inno Setup 6
+2. Double-click `BuildInstaller.bat`
+3. Grab the generated installer from the `dist` folder
+
+The installer copies `Launcher.bat`, `actualscript.ps1`, `README.md`, and `LICENSE` into Program Files and creates shortcuts to launch the tool.
+
+## GitHub Publishing
+
+Recommended files to commit:
+
+- `actualscript.ps1`
+- `Launcher.bat`
+- `installer.iss`
+- `BuildInstaller.bat`
+- `README.md`
+- `LICENSE`
+- `.gitignore`
+
+The generated `dist` folder is ignored so you can publish source cleanly and attach built installers to GitHub Releases instead.
 
 ## DO NOT RUN THE .ps1 RUN THE .bat

@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
+title ImFuckingParanoid
 
 set "SCRIPT_DIR=%~dp0"
 set "PS_SCRIPT=%SCRIPT_DIR%actualscript.ps1"
@@ -33,7 +34,14 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-echo Running privacy script...
+echo ============================================================
+echo ImFuckingParanoid
+echo ============================================================
+echo.
+echo This will open the interactive console with:
+echo   - Express Settings ^(recommended settings^)
+echo   - Custom category selection
+echo   - A pre-scan to avoid reapplying tweaks that already exist
 echo.
 
 powershell.exe ^
