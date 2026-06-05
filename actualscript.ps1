@@ -1,4 +1,4 @@
-# ImFuckingParanoid console
+# ImFuckingParanoid Console
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)) {
 
@@ -464,6 +464,51 @@ function Get-ServiceState {
     Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $ServiceName) -ErrorAction Stop
 }
 
+# Bulk-fetched caches populated once per status scan run — avoids per-tweak WMI round-trips on slow hardware
+$script:ServiceCache = $null
+$script:TaskCache    = $null
+
+function Warm-StatusCaches {
+    param([pscustomobject[]]$Tweaks)
+
+    $needsServices = $Tweaks | Where-Object { $_.Type -eq "Service" }
+    $needsTasks    = $Tweaks | Where-Object { $_.Type -eq "Task" }
+
+    if ($needsServices) {
+        Log-Debug "Warming service cache."
+        $script:ServiceCache = @{}
+        Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ForEach-Object {
+            $script:ServiceCache[$_.Name] = $_
+        }
+    }
+
+    if ($needsTasks) {
+        Log-Debug "Warming task cache."
+        $script:TaskCache = @{}
+        Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
+            $key = "{0}|{1}" -f $_.TaskPath, $_.TaskName
+            $script:TaskCache[$key] = $_
+        }
+    }
+}
+
+function Get-CachedService {
+    param([string]$ServiceName)
+    if ($null -ne $script:ServiceCache) {
+        return $script:ServiceCache[$ServiceName]
+    }
+    return Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $ServiceName) -ErrorAction SilentlyContinue
+}
+
+function Get-CachedTask {
+    param([string]$TaskPath, [string]$TaskName)
+    if ($null -ne $script:TaskCache) {
+        $key = "{0}|{1}" -f $TaskPath, $TaskName
+        return $script:TaskCache[$key]
+    }
+    return Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+}
+
 function Test-Tweak {
     param(
         [Parameter(Mandatory = $true)]
@@ -473,7 +518,8 @@ function Test-Tweak {
     switch ($Tweak.Type) {
         "Service" {
             try {
-                $service = Get-ServiceState -ServiceName $Tweak.ServiceName
+                $service = Get-CachedService -ServiceName $Tweak.ServiceName
+                if ($null -eq $service) { throw "Service not found." }
                 $disabled = $service.StartMode -eq "Disabled"
                 $stopped = $service.State -ne "Running"
                 $applied = $disabled -and $stopped
@@ -511,13 +557,8 @@ function Test-Tweak {
             }
         }
         "Task" {
-            try {
-                $task = Get-ScheduledTask -TaskName $Tweak.TaskName -TaskPath $Tweak.TaskPath -ErrorAction Stop
-                $disabled = ($task.State -eq "Disabled") -or ($task.Settings.Enabled -eq $false)
-                $applied = $disabled
-                $state = if ($applied) { "Applied" } else { "Pending" }
-                $summary = "State={0}" -f $task.State
-            } catch {
+            $task = Get-CachedTask -TaskPath $Tweak.TaskPath -TaskName $Tweak.TaskName
+            if ($null -eq $task) {
                 return [pscustomobject]@{
                     Tweak      = $Tweak
                     Applicable = $false
@@ -526,6 +567,10 @@ function Test-Tweak {
                     Summary    = "Task not present on this build."
                 }
             }
+            $disabled = ($task.State -eq "Disabled") -or ($task.Settings.Enabled -eq $false)
+            $applied = $disabled
+            $state = if ($applied) { "Applied" } else { "Pending" }
+            $summary = "State={0}" -f $task.State
         }
         "Hosts" {
             try {
@@ -572,6 +617,7 @@ function Test-Tweak {
 function Get-TweakStatuses {
     param([pscustomobject[]]$Tweaks)
     Log-Debug ("Scanning {0} tweak(s) for current state." -f $Tweaks.Count)
+    Warm-StatusCaches -Tweaks $Tweaks
     foreach ($tweak in $Tweaks) {
         Test-Tweak -Tweak $tweak
     }
