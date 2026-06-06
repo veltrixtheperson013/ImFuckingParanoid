@@ -1,24 +1,36 @@
+param([string]$LogFile = "")
+
 # ImFuckingParanoid console
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)) {
 
     Write-Host "Requesting administrator privileges..."
-    Start-Process powershell -Verb RunAs -ArgumentList @(
+    $adminArgs = @(
         "-NoProfile"
         "-ExecutionPolicy", "Bypass"
         "-File", "`"$PSCommandPath`""
     )
+    if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+        $adminArgs += @("-LogFile", "`"$LogFile`"")
+    }
+    Start-Process powershell -Verb RunAs -ArgumentList $adminArgs
     exit
 }
 
 $script:AppName = "ImFuckingParanoid"
 $script:Version = "1.0.0"
-$script:LogFile = "$env:SystemDrive\privacy_script_log.txt"
+$script:ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $PSCommandPath }
+$script:LogRoot = Join-Path -Path $script:ScriptRoot -ChildPath "logs"
+$script:RunStartedAt = Get-Date
+$script:RunTimestamp = $script:RunStartedAt.ToString("yyyy-MM-dd-HH-mm-ss")
+$script:ServiceStateCache = $null
+$script:ScheduledTaskCache = $null
+$script:LogFile = $LogFile
 $script:BackupHosts = "$env:SystemDrive\hosts_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').bak"
 $script:FirewallTag = "ImFuckingParanoid"
 $script:HostsPath = "$env:windir\System32\drivers\etc\hosts"
 $script:HostsBackedUp = $false
-$script:CriticalProcessNames = @("Idle", "System", "Registry", "smss", "csrss", "wininit", "services", "lsass", "winlogon", "fontdrvhost", "dwm", "sihost", "svchost")
+$script:CriticalProcessNames = @("Idle", "System", "Registry", "smss", "csrss", "wininit", "services", "lsass", "winlogon", "fontdrvhost", "dwm", "sihost", "svchost", "MsMpEng", "NisSrv", "SecurityHealthService", "Sense", "MpDefenderCoreService")
 
 if (-not ("FileLockUtil" -as [type])) {
     Add-Type -TypeDefinition @"
@@ -153,6 +165,42 @@ public static class FileLockUtil
 "@
 }
 
+function Initialize-RunLog {
+    if (-not (Test-Path -LiteralPath $script:LogRoot)) {
+        New-Item -Path $script:LogRoot -ItemType Directory -Force | Out-Null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($script:LogFile)) {
+        $script:LogFile = [System.IO.Path]::GetFullPath($script:LogFile)
+        $logDirectory = Split-Path -Parent $script:LogFile
+        if (-not (Test-Path -LiteralPath $logDirectory)) {
+            New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
+        }
+        if (-not (Test-Path -LiteralPath $script:LogFile)) {
+            New-Item -Path $script:LogFile -ItemType File -Force | Out-Null
+        }
+        Add-Content -Path $script:LogFile -Value ("[{0}] [INFO] Main script attached to existing run log for {1} v{2}" -f (Get-Date -Format "HH:mm:ss"), $script:AppName, $script:Version)
+        return
+    }
+
+    $nextRunNumber = 1
+    $existingLogs = @(Get-ChildItem -LiteralPath $script:LogRoot -File -Filter "*-log.txt" -ErrorAction SilentlyContinue)
+    foreach ($log in $existingLogs) {
+        if ($log.Name -match '^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-(\d+)-log\.txt$') {
+            $runNumber = [int]$Matches[1]
+            if ($runNumber -ge $nextRunNumber) {
+                $nextRunNumber = $runNumber + 1
+            }
+        }
+    }
+
+    $logName = "{0}-{1:0000}-log.txt" -f $script:RunTimestamp, $nextRunNumber
+    $script:LogFile = Join-Path -Path $script:LogRoot -ChildPath $logName
+
+    New-Item -Path $script:LogFile -ItemType File -Force | Out-Null
+    Add-Content -Path $script:LogFile -Value ("[{0}] [INFO] Run log created for {1} v{2}" -f $script:RunStartedAt.ToString("HH:mm:ss"), $script:AppName, $script:Version)
+}
+
 function Log {
     param(
         [Parameter(Mandatory = $true)]
@@ -171,14 +219,42 @@ function Log-Debug {
     Log -Message $Message -Level "DEBUG" -Color "DarkGray"
 }
 
+function Get-UiWidth {
+    try {
+        $width = [Console]::WindowWidth - 2
+        if ($width -lt 72) { return 72 }
+        if ($width -gt 96) { return 96 }
+        return $width
+    } catch {
+        return 78
+    }
+}
+
+function Write-UiRule {
+    param(
+        [string]$Color = "DarkCyan",
+        [string]$Char = "="
+    )
+
+    Write-Host ($Char * (Get-UiWidth)) -ForegroundColor $Color
+}
+
+function Write-UiPair {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$Value,
+        [string]$Color = "Gray"
+    )
+
+    Write-Host ("  {0,-12} {1}" -f ($Label + ":"), $Value) -ForegroundColor $Color
+}
+
 function Show-Banner {
     Clear-Host
     Write-Host ""
-    Write-Host "+------------------------------------------------------------------------------+" -ForegroundColor DarkCyan
-    Write-Host "| ImFuckingParanoid                                                            |" -ForegroundColor Cyan
-    Write-Host "| Presets, status scan, and selective application                              |" -ForegroundColor DarkGray
-    Write-Host "+------------------------------------------------------------------------------+" -ForegroundColor DarkCyan
-    Write-Host ("  Version {0}  |  Log: {1}" -f $script:Version, $script:LogFile) -ForegroundColor DarkGray
+    Write-UiRule -Color DarkCyan
+    Write-Host ("  {0}  v{1}" -f $script:AppName.ToUpperInvariant(), $script:Version) -ForegroundColor Cyan
+    Write-UiRule -Color DarkCyan
     Write-Host ""
 }
 
@@ -189,7 +265,7 @@ function Show-Section {
     )
 
     Write-Host $Title -ForegroundColor White
-    Write-Host ("-" * $Title.Length) -ForegroundColor DarkGray
+    Write-Host ("-" * [Math]::Min((Get-UiWidth), [Math]::Max(24, $Title.Length))) -ForegroundColor DarkGray
 }
 
 function Pause-ForKey {
@@ -201,13 +277,13 @@ function Pause-ForKey {
 
 function Show-LoadingPulse {
     $steps = @(
-        "Inspecting machine configuration"
-        "Loading tweak catalog"
-        "Preparing console"
+        "Inspecting machine configuration",
+        "Loading lockdown catalog",
+        "Preparing interactive console"
     )
 
     foreach ($step in $steps) {
-        Write-Host ("  - {0}..." -f $step) -ForegroundColor DarkGray
+        Write-Host ("  [..] {0}..." -f $step) -ForegroundColor DarkGray
         Start-Sleep -Milliseconds 250
     }
 }
@@ -239,11 +315,12 @@ function Get-SystemSummary {
 
 function Show-SystemSummary {
     $summary = Get-SystemSummary
-    Show-Section "Device Specifications"
-    Write-Host ("OS      : {0} ({1})" -f $summary.Caption, $summary.Version) -ForegroundColor Gray
-    Write-Host ("Edition : {0} build {1}" -f $summary.Edition, $summary.Build) -ForegroundColor Gray
-    Write-Host ("User    : {0}" -f $summary.User) -ForegroundColor Gray
-    Write-Host ("Device  : {0}" -f $summary.Device) -ForegroundColor Gray
+    Show-Section "Device"
+    Write-UiPair -Label "OS" -Value ("{0} ({1})" -f $summary.Caption, $summary.Version)
+    Write-UiPair -Label "Build" -Value ("{0} build {1}" -f $summary.Edition, $summary.Build)
+    Write-UiPair -Label "User" -Value $summary.User
+    Write-UiPair -Label "Device" -Value $summary.Device
+    Write-UiPair -Label "Log" -Value $script:LogFile -Color DarkGray
     Write-Host ""
 }
 
@@ -274,6 +351,124 @@ function New-Tweak {
     [pscustomobject]$object
 }
 
+function Convert-ToTweakIdFragment {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    $fragment = ($Value.ToLowerInvariant() -replace "[^a-z0-9]+", "_").Trim("_")
+    if ($fragment.Length -gt 64) {
+        $fragment = $fragment.Substring(0, 64).Trim("_")
+    }
+    return $fragment
+}
+
+function New-HostsTweak {
+    param(
+        [Parameter(Mandatory = $true)][string]$Domain,
+        [bool]$Express = $true
+    )
+
+    New-Tweak -Id ("hosts_{0}" -f (Convert-ToTweakIdFragment -Value $Domain)) -Category "Telemetry Domains" -Type "Hosts" -Name ("Block {0}" -f $Domain) -Description "Blocks this telemetry endpoint in the hosts file." -Express $Express -Data @{
+        Domain = $Domain
+        Address = "0.0.0.0"
+    }
+}
+
+function New-FirewallTweak {
+    param([Parameter(Mandatory = $true)][string]$RemoteAddress)
+
+    New-Tweak -Id ("fw_{0}" -f (Convert-ToTweakIdFragment -Value $RemoteAddress)) -Category "Firewall Blocking" -Type "Firewall" -Name ("Block {0}" -f $RemoteAddress) -Description "Blocks a known telemetry IP at the firewall." -Express $false -Data @{
+        RuleName = "$script:FirewallTag-$RemoteAddress"
+        RemoteAddress = $RemoteAddress
+    }
+}
+
+function Get-TelemetryDomainBlockList {
+    @(
+        "browser.events.data.msn.com",
+        "df.telemetry.microsoft.com",
+        "diagnostics.microsoft.com",
+        "diagnostics.office.com",
+        "diagnostics.support.microsoft.com",
+        "eu-v10c.events.data.microsoft.com",
+        "eu-watsonc.events.data.microsoft.com",
+        "feedback.microsoft-hohm.com",
+        "feedback.search.microsoft.com",
+        "feedback.windows.com",
+        "functional.events.data.microsoft.com",
+        "mobile.events.data.microsoft.com",
+        "oca.telemetry.microsoft.com",
+        "oca.telemetry.microsoft.com.nsatc.net",
+        "officeclient.microsoft.com",
+        "reports.wes.df.telemetry.microsoft.com",
+        "self.events.data.microsoft.com",
+        "services.wes.df.telemetry.microsoft.com",
+        "settings-sandbox.data.microsoft.com",
+        "settings-win.data.microsoft.com",
+        "settings.data.microsoft.com",
+        "sqm.df.telemetry.microsoft.com",
+        "sqm.microsoft.com",
+        "sqm.telemetry.microsoft.com",
+        "sqm.telemetry.microsoft.com.nsatc.net",
+        "statsfe1.update.microsoft.com",
+        "statsfe1.ws.microsoft.com",
+        "statsfe2.update.microsoft.com",
+        "statsfe2.update.microsoft.com.akadns.net",
+        "statsfe2.ws.microsoft.com",
+        "survey.watson.microsoft.com",
+        "telecommand.telemetry.microsoft.com",
+        "telecommand.telemetry.microsoft.com.nsatc.net",
+        "telecommandstorageprod.blob.core.windows.net",
+        "telemetry.appex.bing.net",
+        "telemetry.microsoft.com",
+        "telemetry.remoteapp.windowsazure.com",
+        "telemetry.urs.microsoft.com",
+        "teams.events.data.microsoft.com",
+        "v10.events.data.microsoft.com",
+        "v10.vortex-win.data.microsoft.com",
+        "v10c.events.data.microsoft.com",
+        "v20.events.data.microsoft.com",
+        "vortex-bn2.metron.live.com.nsatc.net",
+        "vortex-cy2.metron.live.com.nsatc.net",
+        "vortex-sandbox.data.microsoft.com",
+        "vortex-win.data.microsoft.com",
+        "vortex.data.microsoft.com",
+        "watson.events.data.microsoft.com",
+        "watson.live.com",
+        "watson.microsoft.com",
+        "watson.ppe.telemetry.microsoft.com",
+        "watson.telemetry.microsoft.com",
+        "watson.telemetry.microsoft.com.nsatc.net",
+        "watsonc.events.data.microsoft.com",
+        "wes.df.telemetry.microsoft.com",
+        "www.telecommandsvc.microsoft.com"
+    ) | Sort-Object -Unique
+}
+
+function Get-TelemetryFirewallAddressList {
+    @(
+        "64.4.54.32",
+        "65.52.100.7",
+        "65.55.108.23",
+        "65.55.138.114",
+        "65.55.252.43",
+        "65.55.252.63",
+        "65.55.252.71",
+        "65.55.252.92",
+        "65.55.252.93",
+        "66.119.144.157",
+        "93.184.215.200",
+        "111.221.29.177",
+        "131.253.40.37",
+        "134.170.30.202",
+        "134.170.52.151",
+        "137.116.81.24",
+        "157.56.91.77",
+        "168.63.108.233",
+        "191.232.139.254",
+        "207.46.101.29"
+    ) | Sort-Object -Unique
+}
+
 function Get-TweakCatalog {
     @(
         New-Tweak -Id "svc_diagtrack" -Category "Telemetry Services" -Type "Service" -Name "Disable DiagTrack" -Description "Stops and disables Connected User Experiences and Telemetry." -Express $true -Data @{
@@ -284,6 +479,12 @@ function Get-TweakCatalog {
         }
         New-Tweak -Id "svc_wersvc" -Category "Telemetry Services" -Type "Service" -Name "Disable WerSvc" -Description "Disables Windows Error Reporting service telemetry uploads." -Express $true -Data @{
             ServiceName = "WerSvc"
+        }
+        New-Tweak -Id "svc_diagnosticshub" -Category "Telemetry Services" -Type "Service" -Name "Disable Diagnostics Hub collector" -Description "Disables the Diagnostics Hub collector service when it exists." -Express $true -Data @{
+            ServiceName = "diagnosticshub.standardcollector.service"
+        }
+        New-Tweak -Id "svc_pcasvc" -Category "Aggressive Services" -Type "Service" -Name "Disable Program Compatibility Assistant" -Description "Aggressive. Disables PCA compatibility tracking and prompts." -Express $false -Data @{
+            ServiceName = "PcaSvc"
         }
 
         New-Tweak -Id "reg_allowtelemetry_policy" -Category "Registry Baseline" -Type "Registry" -Name "Set policy telemetry floor" -Description "Pins policy telemetry level to minimum when supported." -Express $true -Data @{
@@ -389,6 +590,78 @@ function Get-TweakCatalog {
             Value = 1
             ValueType = "DWord"
         }
+        New-Tweak -Id "reg_wer_policy_disabled" -Category "Registry Hardening" -Type "Registry" -Name "Disable Windows Error Reporting by policy" -Description "Turns off Windows Error Reporting uploads through policy." -Express $true -Data @{
+            Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting"
+            ValueName = "Disabled"
+            Value = 1
+            ValueType = "DWord"
+        }
+        New-Tweak -Id "reg_wer_local_disabled" -Category "Registry Hardening" -Type "Registry" -Name "Disable local Windows Error Reporting" -Description "Turns off local Windows Error Reporting configuration." -Express $true -Data @{
+            Path = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting"
+            ValueName = "Disabled"
+            Value = 1
+            ValueType = "DWord"
+        }
+        New-Tweak -Id "reg_sqm_policy" -Category "Registry Hardening" -Type "Registry" -Name "Disable SQM CEIP by policy" -Description "Disables the Software Quality Metrics customer experience program." -Express $true -Data @{
+            Path = "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows"
+            ValueName = "CEIPEnable"
+            Value = 0
+            ValueType = "DWord"
+        }
+        New-Tweak -Id "reg_sqm_local" -Category "Registry Hardening" -Type "Registry" -Name "Disable local SQM CEIP" -Description "Pins local SQM participation off." -Express $true -Data @{
+            Path = "HKLM:\SOFTWARE\Microsoft\SQMClient\Windows"
+            ValueName = "CEIPEnable"
+            Value = 0
+            ValueType = "DWord"
+        }
+        New-Tweak -Id "reg_appcompat_inventory" -Category "Registry Hardening" -Type "Registry" -Name "Disable app compatibility inventory" -Description "Stops application compatibility inventory collection by policy." -Express $true -Data @{
+            Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat"
+            ValueName = "DisableInventory"
+            Value = 1
+            ValueType = "DWord"
+        }
+        New-Tweak -Id "reg_appcompat_ait" -Category "Registry Hardening" -Type "Registry" -Name "Disable Application Impact Telemetry" -Description "Disables AIT app compatibility telemetry when honored by this build." -Express $true -Data @{
+            Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat"
+            ValueName = "AITEnable"
+            Value = 0
+            ValueType = "DWord"
+        }
+        New-Tweak -Id "reg_input_personalization_policy" -Category "Registry Hardening" -Type "Registry" -Name "Disable input personalization policy" -Description "Disables input personalization data collection by policy." -Express $true -Data @{
+            Path = "HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization"
+            ValueName = "AllowInputPersonalization"
+            Value = 0
+            ValueType = "DWord"
+        }
+        New-Tweak -Id "reg_ink_text_collection" -Category "Registry Hardening" -Type "Registry" -Name "Restrict ink and text collection" -Description "Restricts implicit ink and text collection for the current user." -Express $true -Data @{
+            Path = "HKCU:\Software\Microsoft\InputPersonalization"
+            ValueName = "RestrictImplicitTextCollection"
+            Value = 1
+            ValueType = "DWord"
+        }
+        New-Tweak -Id "reg_ink_collection" -Category "Registry Hardening" -Type "Registry" -Name "Restrict implicit ink collection" -Description "Restricts implicit ink collection for the current user." -Express $true -Data @{
+            Path = "HKCU:\Software\Microsoft\InputPersonalization"
+            ValueName = "RestrictImplicitInkCollection"
+            Value = 1
+            ValueType = "DWord"
+        }
+        New-Tweak -Id "reg_contact_harvesting" -Category "Registry Hardening" -Type "Registry" -Name "Disable contact harvesting" -Description "Stops contact harvesting used for personalization." -Express $true -Data @{
+            Path = "HKCU:\Software\Microsoft\InputPersonalization\TrainedDataStore"
+            ValueName = "HarvestContacts"
+            Value = 0
+            ValueType = "DWord"
+        }
+        New-Tweak -Id "reg_handwriting_data_sharing" -Category "Registry Hardening" -Type "Registry" -Name "Disable handwriting data sharing" -Description "Blocks handwriting data sharing policy." -Express $true -Data @{
+            Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\TabletPC"
+            ValueName = "PreventHandwritingDataSharing"
+            Value = 1
+            ValueType = "DWord"
+        }
+        New-Tweak -Id "reg_handwriting_error_reports" -Category "Registry Hardening" -Type "Registry" -Name "Disable handwriting error reports" -Description "Blocks handwriting recognition error reports." -Express $true -Data @{
+            Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\HandwritingErrorReports"
+            ValueName = "PreventHandwritingErrorReports"
+            Value = 1
+            ValueType = "DWord"
+        }
 
         New-Tweak -Id "task_compat_appraiser" -Category "Scheduled Tasks" -Type "Task" -Name "Disable Compatibility Appraiser" -Description "Disables the compatibility telemetry appraiser task." -Express $true -Data @{
             TaskPath = "\Microsoft\Windows\Application Experience\"
@@ -418,50 +691,139 @@ function Get-TweakCatalog {
             TaskPath = "\Microsoft\Windows\DiskDiagnostic\"
             TaskName = "Microsoft-Windows-DiskDiagnosticDataCollector"
         }
+        New-Tweak -Id "task_ait_agent" -Category "Scheduled Tasks" -Type "Task" -Name "Disable AitAgent" -Description "Disables legacy Application Impact Telemetry task when present." -Express $true -Data @{
+            TaskPath = "\Microsoft\Windows\Application Experience\"
+            TaskName = "AitAgent"
+        }
+        New-Tweak -Id "task_mare_backup" -Category "Scheduled Tasks" -Type "Task" -Name "Disable MareBackup" -Description "Disables app compatibility database maintenance when present." -Express $true -Data @{
+            TaskPath = "\Microsoft\Windows\Application Experience\"
+            TaskName = "MareBackup"
+        }
+        New-Tweak -Id "task_pca_patch_db" -Category "Scheduled Tasks" -Type "Task" -Name "Disable PcaPatchDbTask" -Description "Disables Program Compatibility Assistant patch database task." -Express $true -Data @{
+            TaskPath = "\Microsoft\Windows\Application Experience\"
+            TaskName = "PcaPatchDbTask"
+        }
+        New-Tweak -Id "task_kernel_ceip" -Category "Scheduled Tasks" -Type "Task" -Name "Disable KernelCeipTask" -Description "Disables kernel customer experience reporting when present." -Express $true -Data @{
+            TaskPath = "\Microsoft\Windows\Customer Experience Improvement Program\"
+            TaskName = "KernelCeipTask"
+        }
+        New-Tweak -Id "task_bth_sqm" -Category "Scheduled Tasks" -Type "Task" -Name "Disable BthSQM" -Description "Disables Bluetooth SQM reporting when present." -Express $true -Data @{
+            TaskPath = "\Microsoft\Windows\Customer Experience Improvement Program\"
+            TaskName = "BthSQM"
+        }
+        New-Tweak -Id "task_queue_reporting" -Category "Scheduled Tasks" -Type "Task" -Name "Disable WER QueueReporting" -Description "Disables queued Windows Error Reporting uploads." -Express $true -Data @{
+            TaskPath = "\Microsoft\Windows\Windows Error Reporting\"
+            TaskName = "QueueReporting"
+        }
+        New-Tweak -Id "task_feedback_dmclient" -Category "Scheduled Tasks" -Type "Task" -Name "Disable Feedback DmClient" -Description "Disables feedback prompt download task when present." -Express $true -Data @{
+            TaskPath = "\Microsoft\Windows\Feedback\Siuf\"
+            TaskName = "DmClient"
+        }
+        New-Tweak -Id "task_feedback_dmclient_scenario" -Category "Scheduled Tasks" -Type "Task" -Name "Disable Feedback scenario download" -Description "Disables feedback scenario download task when present." -Express $true -Data @{
+            TaskPath = "\Microsoft\Windows\Feedback\Siuf\"
+            TaskName = "DmClientOnScenarioDownload"
+        }
+        New-Tweak -Id "task_power_efficiency_diagnostics" -Category "Scheduled Tasks" -Type "Task" -Name "Disable power efficiency diagnostics" -Description "Disables scheduled power efficiency diagnostic collection." -Express $true -Data @{
+            TaskPath = "\Microsoft\Windows\Power Efficiency Diagnostics\"
+            TaskName = "AnalyzeSystem"
+        }
 
-        New-Tweak -Id "hosts_vortex" -Category "Hosts Blocking" -Type "Hosts" -Name "Block vortex.data.microsoft.com" -Description "Blocks a common telemetry endpoint in the hosts file." -Express $true -Data @{
-            Domain = "vortex.data.microsoft.com"
-            Address = "0.0.0.0"
-        }
-        New-Tweak -Id "hosts_settings_win" -Category "Hosts Blocking" -Type "Hosts" -Name "Block settings-win.data.microsoft.com" -Description "Blocks Windows settings telemetry routing." -Express $true -Data @{
-            Domain = "settings-win.data.microsoft.com"
-            Address = "0.0.0.0"
-        }
-        New-Tweak -Id "hosts_watson" -Category "Hosts Blocking" -Type "Hosts" -Name "Block watson.telemetry.microsoft.com" -Description "Blocks a Watson telemetry endpoint." -Express $true -Data @{
-            Domain = "watson.telemetry.microsoft.com"
-            Address = "0.0.0.0"
-        }
-        New-Tweak -Id "hosts_oca" -Category "Hosts Blocking" -Type "Hosts" -Name "Block oca.telemetry.microsoft.com" -Description "Blocks Microsoft error reporting telemetry name resolution." -Express $true -Data @{
-            Domain = "oca.telemetry.microsoft.com"
-            Address = "0.0.0.0"
-        }
-        New-Tweak -Id "hosts_sqm" -Category "Hosts Blocking" -Type "Hosts" -Name "Block sqm.telemetry.microsoft.com" -Description "Blocks SQM telemetry name resolution." -Express $true -Data @{
-            Domain = "sqm.telemetry.microsoft.com"
-            Address = "0.0.0.0"
-        }
-        New-Tweak -Id "hosts_telecommand" -Category "Hosts Blocking" -Type "Hosts" -Name "Block telecommand.telemetry.microsoft.com" -Description "Blocks additional telemetry command traffic by host name." -Express $true -Data @{
-            Domain = "telecommand.telemetry.microsoft.com"
-            Address = "0.0.0.0"
+        foreach ($domain in Get-TelemetryDomainBlockList) {
+            New-HostsTweak -Domain $domain -Express $true
         }
 
-        New-Tweak -Id "fw_13417030202" -Category "Firewall Blocking" -Type "Firewall" -Name "Block 134.170.30.202" -Description "Blocks a known outbound telemetry IP at the firewall." -Express $false -Data @{
-            RuleName = "$script:FirewallTag-134.170.30.202"
-            RemoteAddress = "134.170.30.202"
-        }
-        New-Tweak -Id "fw_1371168124" -Category "Firewall Blocking" -Type "Firewall" -Name "Block 137.116.81.24" -Description "Blocks a second telemetry IP at the firewall." -Express $false -Data @{
-            RuleName = "$script:FirewallTag-137.116.81.24"
-            RemoteAddress = "137.116.81.24"
-        }
-        New-Tweak -Id "fw_6454398" -Category "Firewall Blocking" -Type "Firewall" -Name "Block 64.4.54.32" -Description "Blocks a legacy telemetry endpoint IP at the firewall." -Express $false -Data @{
-            RuleName = "$script:FirewallTag-64.4.54.32"
-            RemoteAddress = "64.4.54.32"
+        foreach ($address in Get-TelemetryFirewallAddressList) {
+            New-FirewallTweak -RemoteAddress $address
         }
     )
 }
 
 function Get-ServiceState {
     param([string]$ServiceName)
-    Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $ServiceName) -ErrorAction Stop
+    if ($null -eq $script:ServiceStateCache) {
+        Log-Debug "Building service state cache."
+        $script:ServiceStateCache = @{}
+        foreach ($service in Get-CimInstance Win32_Service -ErrorAction Stop) {
+            $script:ServiceStateCache[$service.Name.ToLowerInvariant()] = $service
+        }
+    }
+
+    $key = $ServiceName.ToLowerInvariant()
+    if (-not $script:ServiceStateCache.ContainsKey($key)) {
+        throw "Service not present: $ServiceName"
+    }
+
+    $script:ServiceStateCache[$key]
+}
+
+function Update-ServiceStateCache {
+    param([string]$ServiceName)
+
+    if ($null -eq $script:ServiceStateCache) {
+        return
+    }
+
+    $key = $ServiceName.ToLowerInvariant()
+    $service = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $ServiceName.Replace("'", "''")) -ErrorAction SilentlyContinue
+    if ($null -eq $service) {
+        [void]$script:ServiceStateCache.Remove($key)
+        return
+    }
+
+    $script:ServiceStateCache[$key] = $service
+}
+
+function Get-ScheduledTaskCacheKey {
+    param(
+        [string]$TaskPath,
+        [string]$TaskName
+    )
+
+    $normalizedPath = if ($TaskPath.EndsWith("\")) { $TaskPath } else { "$TaskPath\" }
+    ("{0}{1}" -f $normalizedPath, $TaskName).ToLowerInvariant()
+}
+
+function Get-ScheduledTaskState {
+    param(
+        [string]$TaskPath,
+        [string]$TaskName
+    )
+
+    if ($null -eq $script:ScheduledTaskCache) {
+        Log-Debug "Building scheduled task cache."
+        $script:ScheduledTaskCache = @{}
+        foreach ($task in Get-ScheduledTask -ErrorAction Stop) {
+            $key = Get-ScheduledTaskCacheKey -TaskPath $task.TaskPath -TaskName $task.TaskName
+            $script:ScheduledTaskCache[$key] = $task
+        }
+    }
+
+    $lookupKey = Get-ScheduledTaskCacheKey -TaskPath $TaskPath -TaskName $TaskName
+    if (-not $script:ScheduledTaskCache.ContainsKey($lookupKey)) {
+        throw "Scheduled task not present: $TaskPath$TaskName"
+    }
+
+    $script:ScheduledTaskCache[$lookupKey]
+}
+
+function Update-ScheduledTaskCache {
+    param(
+        [string]$TaskPath,
+        [string]$TaskName
+    )
+
+    if ($null -eq $script:ScheduledTaskCache) {
+        return
+    }
+
+    $lookupKey = Get-ScheduledTaskCacheKey -TaskPath $TaskPath -TaskName $TaskName
+    $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($null -eq $task) {
+        [void]$script:ScheduledTaskCache.Remove($lookupKey)
+        return
+    }
+
+    $script:ScheduledTaskCache[$lookupKey] = $task
 }
 
 function Test-Tweak {
@@ -512,7 +874,7 @@ function Test-Tweak {
         }
         "Task" {
             try {
-                $task = Get-ScheduledTask -TaskName $Tweak.TaskName -TaskPath $Tweak.TaskPath -ErrorAction Stop
+                $task = Get-ScheduledTaskState -TaskName $Tweak.TaskName -TaskPath $Tweak.TaskPath
                 $disabled = ($task.State -eq "Disabled") -or ($task.Settings.Enabled -eq $false)
                 $applied = $disabled
                 $state = if ($applied) { "Applied" } else { "Pending" }
@@ -591,95 +953,32 @@ function Show-SingleSelectMenu {
         Show-SystemSummary
         Show-Section $Title
         Write-Host $Instructions -ForegroundColor DarkGray
+        Write-Host "Hotkeys: number selects, Up/Down moves, Enter confirms, Esc exits." -ForegroundColor DarkGray
         Write-Host ""
 
         for ($i = 0; $i -lt $Options.Count; $i++) {
-            $prefix = if ($i -eq $selected) { ">>" } else { "  " }
+            $prefix = if ($i -eq $selected) { "=>" } else { "  " }
             $color = if ($i -eq $selected) { "Cyan" } else { "Gray" }
-            Write-Host ("{0} {1}" -f $prefix, $Options[$i].Label) -ForegroundColor $color
+            Write-Host ("{0} [{1}] {2}" -f $prefix, ($i + 1), $Options[$i].Label) -ForegroundColor $color
         }
 
         Write-Host ""
-        Write-Host $Options[$selected].Description -ForegroundColor Gray
+        Write-Host ("Selected: {0}" -f $Options[$selected].Description) -ForegroundColor Gray
 
         $key = [Console]::ReadKey($true)
+        $keyName = $key.Key.ToString()
+        if ($keyName -match "^D([1-9])$" -or $keyName -match "^NumPad([1-9])$") {
+            $index = [int]$Matches[1] - 1
+            if ($index -ge 0 -and $index -lt $Options.Count) {
+                return $Options[$index]
+            }
+        }
+
         switch ($key.Key) {
             "UpArrow"   { if ($selected -gt 0) { $selected-- } }
             "DownArrow" { if ($selected -lt ($Options.Count - 1)) { $selected++ } }
             "Enter"     { return $Options[$selected] }
             "Escape"    { return $null }
-        }
-    }
-}
-
-function Show-MultiSelectMenu {
-    param(
-        [Parameter(Mandatory = $true)][string]$Title,
-        [Parameter(Mandatory = $true)][string]$Instructions,
-        [Parameter(Mandatory = $true)][object[]]$Options
-    )
-
-    $selectedIndex = 0
-    $selectedValues = New-Object System.Collections.Generic.HashSet[string]
-
-    foreach ($option in $Options | Where-Object { $_.Recommended }) {
-        [void]$selectedValues.Add([string]$option.Value)
-    }
-
-    while ($true) {
-        Show-Banner
-        Show-SystemSummary
-        if (-not [string]::IsNullOrWhiteSpace($Title)) {
-            Show-Section $Title
-        }
-        if (-not [string]::IsNullOrWhiteSpace($Instructions)) {
-            Write-Host $Instructions -ForegroundColor DarkGray
-        }
-        Write-Host "Space toggles, A selects all, C clears, Enter confirms." -ForegroundColor DarkGray
-        Write-Host ""
-
-        for ($i = 0; $i -lt $Options.Count; $i++) {
-            $option = $Options[$i]
-            $isChecked = $selectedValues.Contains([string]$option.Value)
-            $marker = if ($isChecked) { "[x]" } else { "[ ]" }
-            $prefix = if ($i -eq $selectedIndex) { ">>" } else { "  " }
-            $color = if ($i -eq $selectedIndex) { "Cyan" } else { "Gray" }
-            Write-Host ("{0} {1} {2}" -f $prefix, $marker, $option.Label) -ForegroundColor $color
-        }
-
-        Write-Host ""
-        Write-Host $Options[$selectedIndex].Description -ForegroundColor Gray
-
-        $key = [Console]::ReadKey($true)
-        switch ($key.Key) {
-            "UpArrow" {
-                if ($selectedIndex -gt 0) { $selectedIndex-- }
-            }
-            "DownArrow" {
-                if ($selectedIndex -lt ($Options.Count - 1)) { $selectedIndex++ }
-            }
-            "Spacebar" {
-                $value = [string]$Options[$selectedIndex].Value
-                if ($selectedValues.Contains($value)) {
-                    [void]$selectedValues.Remove($value)
-                } else {
-                    [void]$selectedValues.Add($value)
-                }
-            }
-            "A" {
-                foreach ($option in $Options) {
-                    [void]$selectedValues.Add([string]$option.Value)
-                }
-            }
-            "C" {
-                $selectedValues.Clear()
-            }
-            "Enter" {
-                return @($selectedValues)
-            }
-            "Escape" {
-                return $null
-            }
         }
     }
 }
@@ -698,23 +997,28 @@ function Show-StatusSummary {
     Show-Banner
     Show-SystemSummary
     Show-Section ("Selection Review - {0}" -f $ModeName)
-    Write-Host ("Already applied : {0}" -f $alreadyApplied.Count) -ForegroundColor Green
-    Write-Host ("Still pending   : {0}" -f $pending.Count) -ForegroundColor Yellow
-    Write-Host ("Not available   : {0}" -f $unavailable.Count) -ForegroundColor DarkGray
+    Write-Host ("  Applied {0}  |  Pending {1}  |  Unavailable {2}" -f $alreadyApplied.Count, $pending.Count, $unavailable.Count) -ForegroundColor Cyan
     Write-Host ""
 
     foreach ($group in $Statuses | Group-Object -Property { $_.Tweak.Category }) {
         $groupPending = @($group.Group | Where-Object { $_.Applicable -and -not $_.Applied }).Count
         $groupApplied = @($group.Group | Where-Object { $_.Applicable -and $_.Applied }).Count
         $groupUnavailable = @($group.Group | Where-Object { -not $_.Applicable }).Count
-        Write-Host ("{0,-20} applied {1,2} | pending {2,2} | unavailable {3,2}" -f $group.Name, $groupApplied, $groupPending, $groupUnavailable) -ForegroundColor Gray
+        $color = if ($groupPending -gt 0) { "Yellow" } elseif ($groupApplied -gt 0) { "Green" } else { "DarkGray" }
+        Write-Host ("  {0,-22} applied {1,3} | pending {2,3} | unavailable {3,3}" -f $group.Name, $groupApplied, $groupPending, $groupUnavailable) -ForegroundColor $color
     }
 
     if ($pending.Count -gt 0) {
         Write-Host ""
-        Write-Host "Pending tweaks:" -ForegroundColor White
-        foreach ($status in $pending) {
-            Write-Host ("  - {0}" -f $status.Tweak.Name) -ForegroundColor Yellow
+        Write-Host "Pending preview:" -ForegroundColor White
+        foreach ($group in $pending | Group-Object -Property { $_.Tweak.Category }) {
+            Write-Host ("  {0}" -f $group.Name) -ForegroundColor Yellow
+            foreach ($status in $group.Group | Select-Object -First 4) {
+                Write-Host ("    - {0}" -f $status.Tweak.Name) -ForegroundColor DarkYellow
+            }
+            if ($group.Count -gt 4) {
+                Write-Host ("    ... {0} more in this category" -f ($group.Count - 4)) -ForegroundColor DarkGray
+            }
         }
     }
 
@@ -855,17 +1159,19 @@ function Invoke-WithHostsFileAccess {
         [Parameter(Mandatory = $true)][scriptblock]$Operation
     )
 
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
+    $maxAttempts = 8
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         try {
-            Log-Debug ("Hosts operation start: {0} (attempt {1}/3)" -f $OperationName, $attempt)
-            & $Operation
+            Log-Debug ("Hosts operation start: {0} (attempt {1}/{2})" -f $OperationName, $attempt, $maxAttempts)
+            $result = & $Operation
             Log-Debug ("Hosts operation succeeded: {0}" -f $OperationName)
-            return
+            return $result
         } catch {
             $message = $_.Exception.Message
             Log-Debug ("Hosts operation failed: {0} | {1}" -f $OperationName, $message)
 
-            if ($message -notmatch "being used by another process" -or $attempt -eq 3) {
+            $isTransientLock = $message -match "being used by another process"
+            if (-not $isTransientLock -or $attempt -eq $maxAttempts) {
                 throw
             }
 
@@ -873,7 +1179,7 @@ function Invoke-WithHostsFileAccess {
             if (-not $stoppedAny) {
                 Log-Debug ("No stoppable process was found for {0}. Waiting before retry." -f $OperationName)
             }
-            Start-Sleep -Milliseconds 500
+            Start-Sleep -Milliseconds ([Math]::Min(2500, 300 * $attempt))
         }
     }
 }
@@ -891,6 +1197,42 @@ function Ensure-HostsBackup {
     Log -Message ("Hosts backup created: {0}" -f $script:BackupHosts) -Level "INFO" -Color "Green"
 }
 
+function Apply-HostsTweaks {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject[]]$Tweaks
+    )
+
+    Ensure-HostsBackup
+
+    $addedCount = Invoke-WithHostsFileAccess -OperationName ("Append {0} hosts entries" -f $Tweaks.Count) -Operation {
+        $content = [System.IO.File]::ReadAllText($script:HostsPath)
+        $missingLines = @()
+
+        foreach ($tweak in $Tweaks) {
+            $escaped = [regex]::Escape($tweak.Domain)
+            $pattern = "(?im)^\s*(0\.0\.0\.0|127\.0\.0\.1)\s+{0}(\s+.*)?$" -f $escaped
+            if ($content -notmatch $pattern) {
+                $missingLines += ("{0}`t{1}" -f $tweak.Address, $tweak.Domain)
+            }
+        }
+
+        if ($missingLines.Count -eq 0) {
+            return 0
+        }
+
+        $prefix = ""
+        if ($content.Length -gt 0 -and -not $content.EndsWith([System.Environment]::NewLine)) {
+            $prefix = [System.Environment]::NewLine
+        }
+
+        $appendText = $prefix + ($missingLines -join [System.Environment]::NewLine) + [System.Environment]::NewLine
+        [System.IO.File]::AppendAllText($script:HostsPath, $appendText)
+        return $missingLines.Count
+    }
+
+    Log -Message ("Hosts file updated with {0} new entr{1}." -f $addedCount, $(if ($addedCount -eq 1) { "y" } else { "ies" })) -Level "INFO" -Color "Green"
+}
+
 function Apply-Tweak {
     param(
         [Parameter(Mandatory = $true)][pscustomobject]$Tweak
@@ -904,6 +1246,7 @@ function Apply-Tweak {
                 Stop-Service -Name $Tweak.ServiceName -Force -ErrorAction Stop
             }
             Set-Service -Name $Tweak.ServiceName -StartupType Disabled -ErrorAction Stop
+            Update-ServiceStateCache -ServiceName $Tweak.ServiceName
             return
         }
         "Registry" {
@@ -914,6 +1257,7 @@ function Apply-Tweak {
         "Task" {
             Log-Debug ("Applying task tweak: {0}{1}" -f $Tweak.TaskPath, $Tweak.TaskName)
             Disable-ScheduledTask -TaskName $Tweak.TaskName -TaskPath $Tweak.TaskPath -ErrorAction Stop | Out-Null
+            Update-ScheduledTaskCache -TaskName $Tweak.TaskName -TaskPath $Tweak.TaskPath
             return
         }
         "Hosts" {
@@ -944,10 +1288,35 @@ function Apply-Tweaks {
     )
 
     $results = @()
+    $hostsTweaks = @($PendingTweaks | Where-Object { $_.Type -eq "Hosts" })
+    $otherTweaks = @($PendingTweaks | Where-Object { $_.Type -ne "Hosts" })
 
-    for ($i = 0; $i -lt $PendingTweaks.Count; $i++) {
-        $tweak = $PendingTweaks[$i]
-        $progress = "[{0}/{1}]" -f ($i + 1), $PendingTweaks.Count
+    if ($hostsTweaks.Count -gt 0) {
+        Log -Message ("[hosts] Applying {0} telemetry domain block(s) in one hosts-file update" -f $hostsTweaks.Count) -Level "INFO" -Color "Cyan"
+
+        try {
+            Apply-HostsTweaks -Tweaks $hostsTweaks
+            foreach ($tweak in $hostsTweaks) {
+                $status = Test-Tweak -Tweak $tweak
+                if ($status.Applied) {
+                    Log-Debug ("Verified hosts entry: {0}" -f $tweak.Domain)
+                    $results += [pscustomobject]@{ Tweak = $tweak; Success = $true; Summary = $status.Summary }
+                } else {
+                    Log -Message ("Verification still pending: {0}" -f $tweak.Name) -Level "ERROR" -Color "Red"
+                    $results += [pscustomobject]@{ Tweak = $tweak; Success = $false; Summary = $status.Summary }
+                }
+            }
+        } catch {
+            Log -Message ("Failed hosts batch update: {0}" -f $_.Exception.Message) -Level "ERROR" -Color "Red"
+            foreach ($tweak in $hostsTweaks) {
+                $results += [pscustomobject]@{ Tweak = $tweak; Success = $false; Summary = $_.Exception.Message }
+            }
+        }
+    }
+
+    for ($i = 0; $i -lt $otherTweaks.Count; $i++) {
+        $tweak = $otherTweaks[$i]
+        $progress = "[{0}/{1}]" -f ($i + 1), $otherTweaks.Count
         Log -Message ("{0} Applying {1}" -f $progress, $tweak.Name) -Level "INFO" -Color "Cyan"
 
         try {
@@ -963,6 +1332,16 @@ function Apply-Tweaks {
         } catch {
             Log -Message ("Failed: {0} | {1}" -f $tweak.Name, $_.Exception.Message) -Level "ERROR" -Color "Red"
             $results += [pscustomobject]@{ Tweak = $tweak; Success = $false; Summary = $_.Exception.Message }
+        }
+    }
+
+    $hostsChanged = @($results | Where-Object { $_.Success -and $_.Tweak.Type -eq "Hosts" }).Count
+    if ($hostsChanged -gt 0) {
+        try {
+            Clear-DnsClientCache -ErrorAction Stop
+            Log -Message "DNS client cache flushed after hosts updates." -Level "INFO" -Color "Green"
+        } catch {
+            Log -Message ("DNS cache flush skipped: {0}" -f $_.Exception.Message) -Level "WARNING" -Color "Yellow"
         }
     }
 
@@ -984,10 +1363,8 @@ function Show-CompletionSummary {
     Show-Banner
     Show-SystemSummary
     Show-Section ("Completed - {0}" -f $ModeName)
-    Write-Host ("Already applied before run : {0}" -f $appliedBefore) -ForegroundColor Green
-    Write-Host ("Pending before run         : {0}" -f $pendingBefore) -ForegroundColor Yellow
-    Write-Host ("Applied this run           : {0}" -f $successes) -ForegroundColor Green
-    Write-Host ("Failed this run            : {0}" -f $failures) -ForegroundColor $(if ($failures -gt 0) { "Red" } else { "DarkGray" })
+    Write-Host ("  Before: applied {0}, pending {1}" -f $appliedBefore, $pendingBefore) -ForegroundColor Gray
+    Write-Host ("  Run   : applied {0}, failed {1}" -f $successes, $failures) -ForegroundColor $(if ($failures -gt 0) { "Red" } else { "Green" })
     Write-Host ""
 
     if ($failures -gt 0) {
@@ -999,30 +1376,6 @@ function Show-CompletionSummary {
     }
 
     Write-Host "A reboot is recommended so Windows fully reloads the changed policies and services." -ForegroundColor Gray
-}
-
-function Build-CustomCategoryOptions {
-    param([pscustomobject[]]$Tweaks)
-
-    $grouped = $Tweaks | Group-Object -Property Category
-    $recommended = @("Telemetry Services", "Registry Baseline", "Registry Hardening", "Scheduled Tasks", "Hosts Blocking")
-
-    foreach ($group in $grouped | Sort-Object Name) {
-        [pscustomobject]@{
-            Label       = "{0} ({1})" -f $group.Name, $group.Count
-            Description = switch ($group.Name) {
-                "Telemetry Services" { "Recommended. Shuts down the most obvious telemetry-related services." }
-                "Registry Baseline"  { "Recommended. Core privacy policy and advertising settings." }
-                "Registry Hardening" { "Recommended. Extra experience, activity, and search restrictions." }
-                "Scheduled Tasks"    { "Recommended. Disables CEIP and appraiser style tasks." }
-                "Hosts Blocking"     { "Recommended. Adds a curated hosts blocklist for well-known telemetry names." }
-                "Firewall Blocking"  { "More aggressive. Adds IP-based outbound firewall rules that can be brittle over time." }
-                default              { "Selectable tweak category." }
-            }
-            Value       = $group.Name
-            Recommended = $recommended -contains $group.Name
-        }
-    }
 }
 
 function Resolve-Selection {
@@ -1037,18 +1390,9 @@ function Resolve-Selection {
             Log-Debug ("Express Settings selected {0} tweak(s)." -f $selection.Count)
             return $selection
         }
-        "Custom" {
-            $categoryOptions = Build-CustomCategoryOptions -Tweaks $Catalog
-            $selectedCategories = Show-MultiSelectMenu -Title "" -Instructions "" -Options $categoryOptions
-
-            if ($null -eq $selectedCategories -or $selectedCategories.Count -eq 0) {
-                Log-Debug "Custom mode ended with no categories selected."
-                return @()
-            }
-
-            Log-Debug ("Custom categories selected: {0}" -f ($selectedCategories -join ", "))
-            $selection = @($Catalog | Where-Object { $selectedCategories -contains $_.Category })
-            Log-Debug ("Custom selection resolved to {0} tweak(s)." -f $selection.Count)
+        "Maximum Lockdown" {
+            $selection = @($Catalog)
+            Log-Debug ("Maximum Lockdown selected {0} tweak(s)." -f $selection.Count)
             return $selection
         }
         default {
@@ -1071,6 +1415,7 @@ function Maybe-Restart {
     }
 }
 
+Initialize-RunLog
 Show-Banner
 Show-LoadingPulse
 
@@ -1081,11 +1426,11 @@ Log-Debug ("Catalog loaded with {0} tweak(s)." -f $catalog.Count)
 $menuOptions = @(
     [pscustomobject]@{
         Label = "Express Settings"
-        Description = "Applies the recommended settings. Includes service shutdowns, registry/privacy policies, task disables, and curated hosts blocking. It intentionally skips the more brittle IP firewall rules."
+        Description = "Recommended baseline: services, policies, tasks, and expanded telemetry domain blocking."
     }
     [pscustomobject]@{
-        Label = "Custom"
-        Description = "Pick your own categories, including the more aggressive firewall rules if you prefer."
+        Label = "Maximum Lockdown"
+        Description = "Applies every catalog item, including aggressive services and IP firewall blocks."
     }
     [pscustomobject]@{
         Label = "Exit"
