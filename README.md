@@ -1,5 +1,8 @@
 # ImFuckingParanoid
 
+> [!CAUTION]
+> This project is no longer maintained. 
+
 ImFuckingParanoid is a production-ready Windows telemetry reduction tool for users who want tighter control over outbound diagnostics, telemetry services, scheduled tasks, and known telemetry endpoints.
 
 **Version:** 1.0.0
